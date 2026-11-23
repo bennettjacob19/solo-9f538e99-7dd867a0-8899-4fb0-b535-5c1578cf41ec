@@ -45,8 +45,31 @@ CREATE TABLE IF NOT EXISTS rotation_jobs (
     completed_at    TEXT
 );
 
+-- Per-backup "resume preparation" state.  The prepared chunk file itself
+-- lives on the ciphertext volume next to the original blob; this table only
+-- tracks metadata.  A backup is served from prepared chunks only while its
+-- row says 'ready'.
+CREATE TABLE IF NOT EXISTS resume_preps (
+    backup_id    TEXT PRIMARY KEY REFERENCES backups(id) ON DELETE CASCADE,
+    state        TEXT NOT NULL CHECK (state IN ('preparing', 'ready', 'failed')),
+    chunk_size   INTEGER NOT NULL,
+    chunk_count  INTEGER NOT NULL DEFAULT 0,
+    prep_path    TEXT NOT NULL,
+    sha256       TEXT NOT NULL,
+    error        TEXT,
+    created_at   TEXT NOT NULL,
+    updated_at   TEXT NOT NULL
+);
+
+-- Tiny key/value store for service-wide toggles (e.g. pausing preparation).
+CREATE TABLE IF NOT EXISTS settings (
+    key    TEXT PRIMARY KEY,
+    value  TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_wrapped_backup ON wrapped_keys(backup_id);
 CREATE INDEX IF NOT EXISTS idx_wrapped_kek ON wrapped_keys(kek_id);
+CREATE INDEX IF NOT EXISTS idx_prep_state ON resume_preps(state);
 """
 
 

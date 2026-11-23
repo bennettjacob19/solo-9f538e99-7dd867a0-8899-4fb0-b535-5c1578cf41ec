@@ -1,7 +1,8 @@
-# 加密备份服务（支持主密钥在线轮换）
+# 加密备份服务（支持主密钥在线轮换 + 断点续传准备）
 
 基于 Flask + SQLite + `cryptography` 的小型备份页：上传小文件加密备份、下载还原原件，
-并支持主密钥（KEK）的发起轮换、进度查看和旧密钥移除。
+并支持主密钥（KEK）的发起轮换、进度查看和旧密钥移除。备份页可为单份备份执行
+"准备续传"：之后就绪备份的下载链接支持 HTTP Range 断点续传，且只读取所需密文块。
 
 ## 1. 密码学模型：信封加密
 
@@ -39,7 +40,33 @@ DEK ──AES-256-GCM(KEK)──► wrapped_dek（SQLite，密钥卷）
 3. 当所有旧 KEK 下的备份都有了新 KEK 包装，任务置 `completed`（旧包装保留，直到显式移除旧 KEK）。
 4. 控制台对已退役且可安全移除的 KEK 显示"移除并粉碎"按钮；移除时覆写+删除密钥文件。
 
-## 3. 快速开始（Docker Compose）
+## 3. 断点续传准备（HTTP Range resume）
+
+未准备的备份走**原规则**：每次下载（含 Range 请求）都读取并校验整份密文，由
+`send_file` 在已校验明文上切片返回。为单份备份点击"准备续传"后，后台 worker 会：
+
+1. 解开 DEK，解密整份原始 blob 并校验 SHA-256（**原件校验不通过则准备失败**）；
+2. 把明文按 64 KiB 逐块用**同一 DEK** 重新加密（AES-256-GCM，AAD 绑定
+   `backup_id + 块序号 + 全文件 SHA-256`），写入 `*.prep.tmp`；
+3. fsync 后原子改名 `<backup_id>.prep`，再落库置为 `ready` —— **写全之前不显示就绪**。
+
+就绪后的语义：
+
+| 需求 | 实现方式 |
+| --- | --- |
+| 只读所需密文 | 每块独立认证，连续 64 KiB 请求最多触及 2 个块记录（≤ 128 KiB + 56 B），远低于 512 KiB 预算 |
+| 先认证后返回 | 请求范围涉及的全部块通过 GCM 认证后才返回 206；任一块失败返回 500，**不发送任何明文** |
+| 坏段隔离 | 某块密文损坏只影响覆盖该块的 Range 请求；其余块照常 206，整份下载（走原 blob）也不受影响 |
+| 额外磁盘有界 | 每块仅多 28 B（12 B nonce + 16 B tag），单份准备 ≤ 原密文 + 64 KiB；重试前先清旧文件 |
+| 重启语义 | `ready` 行与 `.prep` 文件都在卷上，重启后直接续传；`preparing` 行由 worker 自动重试，启动时清理孤儿临时文件 |
+| 失败可重试 | 准备失败只影响该功能本身：原链接仍按原规则整份下载，页面可重试 |
+| 与轮换正交 | 块用 DEK 加密而非 KEK，轮换只重包装 DEK；正常移除旧主密钥后就绪备份仍可续传 |
+| 暂停不阻塞 | "暂停准备"只让准备 worker 空转；上传、整份下载、主密钥轮换照常完成（准备的重计算不持有写锁） |
+
+原始 blob 永远保留、永不改写：整份下载的校验逻辑与之前完全一致；两个卷上都只有密文
+（`.prep` 与 `.blob` 同在密文卷），密钥卷仍只有 KEK 文件与 SQLite 元数据。
+
+## 4. 快速开始（Docker Compose）
 
 ```bash
 docker compose up --build
@@ -65,9 +92,10 @@ volumes:
 | `DB_PATH` | `$KEYSTORE_DIR/backup.db` | SQLite 路径 |
 | `ROTATION_INTERVAL` | `1` | 后台轮换轮询秒数 |
 | `ROTATION_BATCH` | `10` | 每个 tick 重包装的备份数 |
+| `PREP_INTERVAL` | `1` | 后台续传准备轮询秒数 |
 | `MAX_UPLOAD_MB` | `16` | 单文件上传上限（MB） |
 
-## 4. 本地开发
+## 5. 本地开发
 
 ```bash
 python3 -m venv --without-pip .venv        # 若系统没有 ensurepip
@@ -77,28 +105,30 @@ KEYSTORE_DIR=./data/keystore VOLUME_DIR=./data/volumes \
   .venv/bin/python -m backup_app.wsgi
 ```
 
-## 5. 测试
+## 6. 测试
 
 ```bash
-.venv/bin/python -I tests/test_service.py   # 17 个服务层测试
-.venv/bin/python -I tests/test_web.py       # 6 个 HTTP 集成测试（含真实后台 worker）
+.venv/bin/python -I tests/test_service.py   # 32 个服务层测试
+.venv/bin/python -I tests/test_web.py       # 14 个 HTTP 集成测试（含真实后台 worker）
 ```
 
 覆盖：加解密往返、DEK 独立性、密文篡改拒绝、轮换不改 blob、中途上传只挂新 KEK、
 模拟进程崩溃后续跑、幂等 tick、移除保护、密钥粉碎、两代轮换后旧密钥全删仍可恢复、
-密钥卷与备份卷材料互斥。
+密钥卷与备份卷材料互斥；续传准备的跨块边界 Range 往返、64 KiB 请求读放大 ≤ 512 KiB、
+磁盘占用 ≤ 原密文 + 64 KiB、准备中断/失败后的重试与回退、坏块隔离（206/500）、
+就绪状态跨重启持久、移除旧 KEK 后仍可续传、暂停期间核心操作可用、两卷均无明文。
 
-## 6. 目录结构
+## 7. 目录结构
 
 ```
 backup_app/
   config.py      # 环境变量配置
-  crypto.py      # AES-256-GCM、DEK 包装/解包、AAD 绑定
-  db.py          # SQLite 连接与表结构
+  crypto.py      # AES-256-GCM、DEK 包装/解包、AAD 绑定（含续传块 AAD）
+  db.py          # SQLite 连接与表结构（含 resume_preps / settings）
   keystore.py    # 主密钥文件生成/加载/粉碎（0600、原子写）
-  service.py     # 上传/下载/轮换/移除的全部业务规则
-  worker.py      # 后台轮换线程（无自身状态，全部从 SQLite 恢复）
-  web.py         # Flask 路由与控制台
+  service.py     # 上传/下载/轮换/移除/续传准备的全部业务规则
+  worker.py      # 后台轮换线程 + 续传准备线程（无自身状态，全部从 SQLite 恢复）
+  web.py         # Flask 路由与控制台（含 206 Range 响应）
   wsgi.py        # 入口
   templates/     # 单页控制台
 tests/           # 单元 + HTTP 集成测试
@@ -106,7 +136,7 @@ Dockerfile
 docker-compose.yml
 ```
 
-## 7. 运维注意事项
+## 8. 运维注意事项
 
 - **备份密钥卷**：丢失 `keystore` 卷即永久无法解密；备份卷泄露不构成明文泄露。
 - 移除旧 KEK 前请确认数据库已另行备份；移除操作会覆写并删除密钥文件，不可撤销。

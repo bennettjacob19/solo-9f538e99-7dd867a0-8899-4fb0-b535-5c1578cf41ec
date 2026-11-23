@@ -45,6 +45,20 @@ def file_aad(backup_id: str) -> bytes:
     return b"backup-blob:" + backup_id.encode("ascii")
 
 
+def chunk_aad(backup_id: str, index: int, sha256_hex: str) -> bytes:
+    # Bind a prepared resume chunk to its backup, its position in the chunk
+    # sequence and the plaintext digest of the whole file, so chunks cannot be
+    # reordered or replayed from a different preparation run.
+    return (
+        b"resume-chunk:"
+        + backup_id.encode("ascii")
+        + b":"
+        + str(index).encode("ascii")
+        + b":"
+        + sha256_hex.encode("ascii")
+    )
+
+
 def wrap_dek(kek: bytes, dek: bytes, backup_id: str, kek_id: str) -> bytes:
     return encrypt(kek, dek, _wrap_aad(backup_id, kek_id))
 

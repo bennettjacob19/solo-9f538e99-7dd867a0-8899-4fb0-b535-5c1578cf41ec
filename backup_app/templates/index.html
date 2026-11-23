@@ -88,6 +88,25 @@
         <div class="hint">轮换期间新上传的备份只使用新主密钥；任务中断后重启进程会自动续跑。</div>
       {% endif %}
     </div>
+
+    <div class="card">
+      <h2>断点续传准备</h2>
+      {% if prep_paused %}
+        <div><span class="pill retired">准备已暂停</span></div>
+        <form action="{{ url_for('resume_prepare') }}" method="post" class="inline" style="margin-top:10px">
+          <button class="btn primary" type="submit">恢复准备</button>
+        </form>
+      {% else %}
+        <div><span class="pill active">准备后台运行中</span></div>
+        <form action="{{ url_for('pause_prepare') }}" method="post" class="inline" style="margin-top:10px">
+          <button class="btn" type="submit">暂停准备</button>
+        </form>
+      {% endif %}
+      <div class="hint">
+        为单份备份预生成逐块加密的续传文件后，下载链接即可按 HTTP Range 只取所需密文块（206）。
+        未就绪的备份仍按原规则整份校验下载；暂停准备不影响上传、整份下载与主密钥轮换。
+      </div>
+    </div>
   </div>
 
   <div class="card">
@@ -123,7 +142,7 @@
     <h2>备份（共 {{ backup_count }} 份，合计 {{ total_bytes | human_size }}）</h2>
     {% if backups %}
     <table>
-      <thead><tr><th>文件名</th><th>备份 ID</th><th>大小</th><th>SHA-256</th><th>创建时间</th><th>可恢复所用 KEK</th><th>操作</th></tr></thead>
+      <thead><tr><th>文件名</th><th>备份 ID</th><th>大小</th><th>SHA-256</th><th>创建时间</th><th>可恢复所用 KEK</th><th>续传准备</th><th>操作</th></tr></thead>
       <tbody>
       {% for b in backups %}
         <tr>
@@ -134,6 +153,23 @@
           <td>{{ b.created_at }}</td>
           <td>
             {% for kid in b.kek_ids %}<code>{{ kid[:8] }}…</code>{% if not loop.last %}<br>{% endif %}{% endfor %}
+          </td>
+          <td>
+            {% if b.prep_state == 'ready' %}
+              <span class="pill completed">续传就绪</span>
+            {% elif b.prep_state == 'preparing' %}
+              <span class="pill running">准备中…</span>
+            {% elif b.prep_state == 'failed' %}
+              <span class="pill retired" title="{{ b.prep_error }}">准备失败</span>
+              <form action="{{ url_for('prepare_resume', backup_id=b.id) }}" method="post" class="inline">
+                <button class="btn" type="submit">重试准备</button>
+              </form>
+            {% else %}
+              <span class="muted">未准备</span>
+              <form action="{{ url_for('prepare_resume', backup_id=b.id) }}" method="post" class="inline">
+                <button class="btn" type="submit">准备续传</button>
+              </form>
+            {% endif %}
           </td>
           <td>
             <a class="btn" href="{{ url_for('download', backup_id=b.id) }}">下载还原</a>

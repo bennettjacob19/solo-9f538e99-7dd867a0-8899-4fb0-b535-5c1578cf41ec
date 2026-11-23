@@ -11,6 +11,7 @@ services:
       VOLUME_DIR: /data/volumes
       ROTATION_INTERVAL: "1"
       ROTATION_BATCH: "10"
+      PREP_INTERVAL: "1"
       MAX_UPLOAD_MB: "16"
     volumes:
       - keystore:/data/keystore
